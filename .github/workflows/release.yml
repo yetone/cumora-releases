@@ -71,13 +71,28 @@ jobs:
       - name: Install dependencies
         run: npm ci --no-audit --no-fund
 
-      # ---------- macOS code signing ----------
-      # Imports the Developer ID Application cert into a temporary
-      # keychain so electron-builder can sign + notarise. Apple
-      # credentials come from APPLE_ID / APPLE_APP_SPECIFIC_PASSWORD /
-      # APPLE_TEAM_ID — wired through to electron-builder via env.
-      - name: Import macOS certificates
+      # ---------- macOS code signing (optional) ----------
+      # If MAC_CERTIFICATE_P12 isn't configured, we skip cert import and
+      # produce an UNSIGNED mac build (still installable via right-click
+      # → Open). Once the operator adds the Developer ID cert + Apple
+      # credentials as secrets, subsequent releases sign + notarise
+      # automatically. Lets the first release ship without waiting on
+      # Apple paperwork.
+      - name: Probe macOS signing secrets
+        id: macsig
         if: matrix.platform == 'mac'
+        env:
+          P12: ${{ secrets.MAC_CERTIFICATE_P12 }}
+        run: |
+          if [ -n "$P12" ]; then
+            echo "enabled=true" >> $GITHUB_OUTPUT
+          else
+            echo "enabled=false" >> $GITHUB_OUTPUT
+            echo "::warning::MAC_CERTIFICATE_P12 not set — mac builds will be UNSIGNED. Add it to repo secrets to enable signing."
+          fi
+
+      - name: Import macOS certificates
+        if: matrix.platform == 'mac' && steps.macsig.outputs.enabled == 'true'
         env:
           CERTIFICATE_P12: ${{ secrets.MAC_CERTIFICATE_P12 }}
           CERTIFICATE_PASSWORD: ${{ secrets.MAC_CERTIFICATE_PASSWORD }}
@@ -110,14 +125,33 @@ jobs:
           VITE_CUMORA_API_BASE: https://api.cumora.ai
         run: npm run build
 
-      - name: Package (macOS)
-        if: matrix.platform == 'mac'
+      # When signing secrets are present, electron-builder reads
+      # APPLE_ID / APPLE_APP_SPECIFIC_PASSWORD / APPLE_TEAM_ID from env
+      # and the cert from the keychain. When absent, we pass
+      # `--config.mac.identity=null` + `--config.mac.notarize=false` so
+      # the build doesn't even attempt signing — it produces an
+      # ad-hoc-signed dmg + zip that users can still install.
+      - name: Package (macOS) — signed
+        if: matrix.platform == 'mac' && steps.macsig.outputs.enabled == 'true'
         env:
           NODE_OPTIONS: --max_old_space_size=8192
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: npx electron-builder --mac --${{ matrix.arch }} --publish=never
+
+      - name: Package (macOS) — unsigned
+        if: matrix.platform == 'mac' && steps.macsig.outputs.enabled != 'true'
+        env:
+          NODE_OPTIONS: --max_old_space_size=8192
+          # `CSC_IDENTITY_AUTO_DISCOVERY=false` is the electron-builder
+          # canonical knob for "don't look for any cert". Combined with
+          # the CLI flags below, the build outputs unsigned artifacts.
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: |
+          npx electron-builder --mac --${{ matrix.arch }} --publish=never \
+            -c.mac.identity=null \
+            -c.mac.notarize=false
 
       - name: Package (Windows)
         if: matrix.platform == 'win'
