@@ -56,7 +56,7 @@ jobs:
           fi
 
       - name: Checkout cumora source code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: yetone/cumora
           token: ${{ secrets.CUMORA_REPO_TOKEN }}
@@ -207,14 +207,14 @@ jobs:
       # has our `.github/scripts/merge-mac-yml.py` available to the
       # merge step below.
       - name: Checkout cumora-releases (this repo)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       # Then checkout cumora source into a subdirectory so we can read
       # git history for the changelog (diff between previous tag and
       # this one). Keeping the two checkouts in separate paths avoids
       # the second overwriting the first.
       - name: Checkout cumora source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: yetone/cumora
           token: ${{ secrets.CUMORA_REPO_TOKEN }}
