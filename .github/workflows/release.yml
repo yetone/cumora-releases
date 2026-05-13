@@ -203,8 +203,16 @@ jobs:
             echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
           fi
 
-      # We need git history from cumora to generate the changelog (diff
-      # between previous tag and this one).
+      # Checkout cumora-releases (this repo) first so the workspace
+      # has our `.github/scripts/merge-mac-yml.py` available to the
+      # merge step below.
+      - name: Checkout cumora-releases (this repo)
+        uses: actions/checkout@v4
+
+      # Then checkout cumora source into a subdirectory so we can read
+      # git history for the changelog (diff between previous tag and
+      # this one). Keeping the two checkouts in separate paths avoids
+      # the second overwriting the first.
       - name: Checkout cumora source
         uses: actions/checkout@v4
         with:
@@ -213,6 +221,7 @@ jobs:
           ref: ${{ steps.params.outputs.ref }}
           fetch-depth: 0
           fetch-tags: true
+          path: cumora-src
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -280,8 +289,12 @@ jobs:
           ls -la release/
 
       # ---------- Changelog ----------
+      # Git history lives in cumora-src/ (we checked it out there above);
+      # cumora-releases (this repo's workspace root) has its own
+      # unrelated history. cd into cumora-src for the git queries.
       - name: Get previous tag
         id: prev_tag
+        working-directory: cumora-src
         run: |
           CURRENT_TAG="v${{ steps.params.outputs.version }}"
           PREV_TAG=$(git tag --sort=-v:refname | grep -A1 "^${CURRENT_TAG}$" | tail -1)
@@ -296,6 +309,7 @@ jobs:
 
       - name: Generate changelog with LLM
         id: changelog
+        working-directory: cumora-src
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
