@@ -221,8 +221,22 @@ jobs:
 
       # electron-builder emits one `latest-mac.yml` per arch when each is
       # built separately. The auto-updater reads ONE feed, so we merge
-      # the file lists from arm64 + x64 into a single yml that lists all
-      # downloadable artifacts under `files:`.
+      # the file lists from arm64 + x64.
+      #
+      # Why this isn't a simple bash awk concat anymore: electron-builder's
+      # per-arch yml can contain duplicate entries (when build.mac.target
+      # lists both archs in package.json, the yml from the arm64 runner
+      # still references some Intel-target shas — but those shas are stale
+      # vs. what the Intel runner actually produced). The bash concat then
+      # output 2x duplicates with different shas, and electron-updater
+      # picked the FIRST (stale) one for SHA verification → 0.1.6
+      # autoupdate failed with "sha512 checksum mismatch".
+      #
+      # Python merge dedupes by url, computes the REAL sha512 + size from
+      # each on-disk file in release/, and writes one entry per unique
+      # filename. After dedupe, the entries are sorted (arm64 first, then
+      # Intel) so the top-level `path:` + `sha512:` point at the arm64-mac
+      # zip — that's the canonical "primary platform" feed entry.
       - name: Merge artifacts and macOS yml files
         run: |
           mkdir -p release
@@ -240,30 +254,79 @@ jobs:
           MERGED_YML="release/latest-mac.yml"
 
           if [ -f "$ARM64_YML" ] && [ -f "$X64_YML" ]; then
-            echo "Merging latest-mac.yml files..."
+            echo "Merging latest-mac.yml files via python (dedupe + recompute sha)..."
 
-            VERSION=$(grep "^version:" "$ARM64_YML" | head -1)
-            RELEASE_DATE=$(grep "^releaseDate:" "$ARM64_YML" | head -1)
+            python3 <<PY
+import base64
+import hashlib
+import os
+import re
 
-            ARM64_FILES=$(awk '/^files:/{flag=1; next} /^[a-zA-Z]/ && flag{flag=0} flag' "$ARM64_YML")
-            X64_FILES=$(awk '/^files:/{flag=1; next} /^[a-zA-Z]/ && flag{flag=0} flag' "$X64_YML")
+VERSION = "${{ steps.params.outputs.version }}"
+RELEASE = "release"
 
-            PATH_LINE=$(grep "^path:" "$ARM64_YML" | head -1)
-            SHA512_LINE=$(grep "^sha512:" "$ARM64_YML" | head -1)
+def real_sha_size(name):
+    """Return (sha512_base64, size) for an on-disk file in release/."""
+    h = hashlib.sha512()
+    n = 0
+    with open(os.path.join(RELEASE, name), "rb") as f:
+        while True:
+            chunk = f.read(1 << 20)
+            if not chunk:
+                break
+            h.update(chunk)
+            n += len(chunk)
+    return base64.b64encode(h.digest()).decode(), n
 
-            echo "$VERSION" > "$MERGED_YML"
-            echo "files:" >> "$MERGED_YML"
-            echo "$ARM64_FILES" >> "$MERGED_YML"
-            echo "$X64_FILES" >> "$MERGED_YML"
-            echo "$PATH_LINE" >> "$MERGED_YML"
-            echo "$SHA512_LINE" >> "$MERGED_YML"
-            echo "$RELEASE_DATE" >> "$MERGED_YML"
+# Discover mac artifacts on disk (the source of truth — what we'll publish).
+# Sort arm64 entries first, then Intel, so the primary 'path:' picks arm64.
+def is_mac(name):
+    return name.endswith(".dmg") or name.endswith(".zip")
 
-            echo "Merged latest-mac.yml:"
+entries = sorted(
+    [f for f in os.listdir(RELEASE) if is_mac(f)],
+    key=lambda n: (0 if "arm64" in n else 1,
+                   0 if n.endswith(".zip") else 1, n),
+)
+
+if not entries:
+    print("No mac artifacts found, skipping merged yml")
+    raise SystemExit(0)
+
+import datetime
+release_date = datetime.datetime.utcnow().isoformat() + "Z"
+release_date_iso = "'" + release_date + "'"
+
+with open(os.path.join(RELEASE, "latest-mac.yml"), "w") as out:
+    out.write(f"version: {VERSION}\n")
+    out.write("files:\n")
+    for name in entries:
+        sha, size = real_sha_size(name)
+        out.write(f"  - url: {name}\n")
+        out.write(f"    sha512: {sha}\n")
+        out.write(f"    size: {size}\n")
+    # Top-level path/sha point at the primary entry — first in sorted
+    # order, which by our sort key is arm64 zip when present.
+    primary = entries[0]
+    psha, _ = real_sha_size(primary)
+    out.write(f"path: {primary}\n")
+    out.write(f"sha512: {psha}\n")
+    out.write(f"releaseDate: {release_date_iso}\n")
+print("Wrote merged latest-mac.yml with", len(entries), "entries")
+PY
+
+            echo "=== merged latest-mac.yml ==="
             cat "$MERGED_YML"
-          elif [ -f "$ARM64_YML" ]; then
+          fi
+
+          # Fallback — only one arch's yml is available (the other build
+          # failed or wasn't dispatched). Copy verbatim; electron-updater
+          # will serve single-arch users, the missing arch just stays at
+          # an older version until the next full release.
+          if [ ! -f "$MERGED_YML" ] && [ -f "$ARM64_YML" ]; then
             cp "$ARM64_YML" "$MERGED_YML"
-          elif [ -f "$X64_YML" ]; then
+          fi
+          if [ ! -f "$MERGED_YML" ] && [ -f "$X64_YML" ]; then
             cp "$X64_YML" "$MERGED_YML"
           fi
 
