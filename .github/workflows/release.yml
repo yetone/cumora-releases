@@ -383,37 +383,13 @@ jobs:
           '
           echo "All files uploaded to R2!"
 
-      # ---------- Stable "latest" aliases ----------
-      # Marketing-page download buttons link to fixed URLs like
-      # `updates.cumora.ai/Cumora-arm64.dmg` (no version in the path).
-      # Server-side-copy the versioned files to those stable keys so the
-      # marketing site never needs touching on a version bump. The
-      # autoupdate feed (latest-mac.yml / latest.yml / latest-linux.yml)
-      # is ALREADY at a stable path — that's a side effect of how
-      # electron-builder names them — so nothing extra needed there.
-      - name: Publish stable download aliases on R2
-        if: steps.r2.outputs.enabled == 'true'
-        env:
-          R2_ENDPOINT: https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com
-          VERSION: ${{ steps.params.outputs.version }}
-        run: |
-          declare -A PAIRS=(
-            ["Cumora-${VERSION}-arm64.dmg"]="Cumora-arm64.dmg"
-            ["Cumora-${VERSION}.dmg"]="Cumora-x64.dmg"
-            ["Cumora Setup ${VERSION}.exe"]="Cumora-Setup.exe"
-            ["Cumora-${VERSION}.AppImage"]="Cumora.AppImage"
-            ["cumora_${VERSION}_amd64.deb"]="cumora-amd64.deb"
-          )
-          for src in "${!PAIRS[@]}"; do
-            dst="${PAIRS[$src]}"
-            if [ -f "release/$src" ]; then
-              echo "Aliasing $src → $dst"
-              aws s3 cp "s3://cumora-updates/$src" "s3://cumora-updates/$dst" \
-                --endpoint-url "$R2_ENDPOINT" --no-progress
-            else
-              echo "Skipping $src (artifact missing for this build)"
-            fi
-          done
+      # No stable "latest" aliases — the user-facing filenames keep
+      # their version in them (e.g. Cumora-0.1.2-arm64.dmg) so the
+      # downloaded file on disk carries the version. The marketing site
+      # (cumora.ai) resolves the right URL at page load by fetching
+      # latest-mac.yml / latest.yml / latest-linux.yml from updates.cumora.ai
+      # and parsing the filename out of the `files:` list — same feed the
+      # in-app autoupdater reads. No alias pipeline to maintain.
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
