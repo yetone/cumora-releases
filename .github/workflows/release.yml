@@ -123,7 +123,12 @@ jobs:
       - name: Build renderer
         env:
           VITE_CUMORA_API_BASE: https://api.cumora.ai
-        run: npm run build
+        # `build:electron` sets BUILD_TARGET=electron so vite emits
+        # relative asset paths (./assets/index-XXX.js). Default web
+        # build uses `/` paths, which the Electron file:// loader
+        # resolves to file:///assets/... and 404s — that was v0.1.2/3
+        # white-screen cause.
+        run: npm run build:electron
 
       # When signing secrets are present, electron-builder reads
       # APPLE_ID / APPLE_APP_SPECIFIC_PASSWORD / APPLE_TEAM_ID from env
