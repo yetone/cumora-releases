@@ -254,67 +254,8 @@ jobs:
           MERGED_YML="release/latest-mac.yml"
 
           if [ -f "$ARM64_YML" ] && [ -f "$X64_YML" ]; then
-            echo "Merging latest-mac.yml files via python (dedupe + recompute sha)..."
-
-            python3 <<PY
-import base64
-import hashlib
-import os
-import re
-
-VERSION = "${{ steps.params.outputs.version }}"
-RELEASE = "release"
-
-def real_sha_size(name):
-    """Return (sha512_base64, size) for an on-disk file in release/."""
-    h = hashlib.sha512()
-    n = 0
-    with open(os.path.join(RELEASE, name), "rb") as f:
-        while True:
-            chunk = f.read(1 << 20)
-            if not chunk:
-                break
-            h.update(chunk)
-            n += len(chunk)
-    return base64.b64encode(h.digest()).decode(), n
-
-# Discover mac artifacts on disk (the source of truth — what we'll publish).
-# Sort arm64 entries first, then Intel, so the primary 'path:' picks arm64.
-def is_mac(name):
-    return name.endswith(".dmg") or name.endswith(".zip")
-
-entries = sorted(
-    [f for f in os.listdir(RELEASE) if is_mac(f)],
-    key=lambda n: (0 if "arm64" in n else 1,
-                   0 if n.endswith(".zip") else 1, n),
-)
-
-if not entries:
-    print("No mac artifacts found, skipping merged yml")
-    raise SystemExit(0)
-
-import datetime
-release_date = datetime.datetime.utcnow().isoformat() + "Z"
-release_date_iso = "'" + release_date + "'"
-
-with open(os.path.join(RELEASE, "latest-mac.yml"), "w") as out:
-    out.write(f"version: {VERSION}\n")
-    out.write("files:\n")
-    for name in entries:
-        sha, size = real_sha_size(name)
-        out.write(f"  - url: {name}\n")
-        out.write(f"    sha512: {sha}\n")
-        out.write(f"    size: {size}\n")
-    # Top-level path/sha point at the primary entry — first in sorted
-    # order, which by our sort key is arm64 zip when present.
-    primary = entries[0]
-    psha, _ = real_sha_size(primary)
-    out.write(f"path: {primary}\n")
-    out.write(f"sha512: {psha}\n")
-    out.write(f"releaseDate: {release_date_iso}\n")
-print("Wrote merged latest-mac.yml with", len(entries), "entries")
-PY
-
+            echo "Merging latest-mac.yml files via the dedupe script..."
+            python3 .github/scripts/merge-mac-yml.py "${{ steps.params.outputs.version }}"
             echo "=== merged latest-mac.yml ==="
             cat "$MERGED_YML"
           fi
