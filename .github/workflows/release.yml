@@ -1,0 +1,402 @@
+name: Release
+
+# Invoked by the main yetone/cumora repo via repository_dispatch when a
+# `v*` tag is pushed. The dispatch payload carries:
+#   ref      — the git ref to build (typically the tag itself, e.g. v0.1.0)
+#   version  — the bare version string without the "v" prefix (e.g. 0.1.0)
+#
+# Can also be run manually via workflow_dispatch for one-off rebuilds.
+
+on:
+  repository_dispatch:
+    types: [release]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref to build (tag or branch in yetone/cumora)'
+        required: true
+        type: string
+      version:
+        description: 'Version to release (e.g., 0.1.0 — no v prefix)'
+        required: true
+        type: string
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            platform: mac
+            arch: arm64
+          - os: macos-15-intel
+            platform: mac
+            arch: x64
+          - os: windows-latest
+            platform: win
+            arch: x64
+          - os: ubuntu-latest
+            platform: linux
+            arch: x64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Get build parameters
+        id: params
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            echo "ref=${{ github.event.client_payload.ref }}" >> $GITHUB_OUTPUT
+            echo "version=${{ github.event.client_payload.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "ref=${{ github.event.inputs.ref }}" >> $GITHUB_OUTPUT
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout cumora source code
+        uses: actions/checkout@v4
+        with:
+          repository: yetone/cumora
+          token: ${{ secrets.CUMORA_REPO_TOKEN }}
+          ref: ${{ steps.params.outputs.ref }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      # ---------- macOS code signing ----------
+      # Imports the Developer ID Application cert into a temporary
+      # keychain so electron-builder can sign + notarise. Apple
+      # credentials come from APPLE_ID / APPLE_APP_SPECIFIC_PASSWORD /
+      # APPLE_TEAM_ID — wired through to electron-builder via env.
+      - name: Import macOS certificates
+        if: matrix.platform == 'mac'
+        env:
+          CERTIFICATE_P12: ${{ secrets.MAC_CERTIFICATE_P12 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MAC_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          echo "$CERTIFICATE_P12" | base64 --decode > $RUNNER_TEMP/certificate.p12
+          security import $RUNNER_TEMP/certificate.p12 -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          security list-keychain -d user -s "$KEYCHAIN_PATH" login.keychain-db
+
+          rm -f $RUNNER_TEMP/certificate.p12
+
+      # ---------- Build ----------
+      # `npm run build` produces the renderer (dist/), then
+      # electron-builder packages + signs + (on macOS) notarises. The
+      # `--<arch>` flag picks arm64 vs x64 on macOS so we get separate
+      # artifacts per arch. Outputs land in `release/` per the build
+      # config in package.json. `--publish=never` keeps electron-builder
+      # from trying to upload itself — the publish job below handles
+      # GitHub Release + R2 mirror in one place.
+      - name: Build renderer
+        env:
+          VITE_CUMORA_API_BASE: https://api.cumora.ai
+        run: npm run build
+
+      - name: Package (macOS)
+        if: matrix.platform == 'mac'
+        env:
+          NODE_OPTIONS: --max_old_space_size=8192
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: npx electron-builder --mac --${{ matrix.arch }} --publish=never
+
+      - name: Package (Windows)
+        if: matrix.platform == 'win'
+        env:
+          NODE_OPTIONS: --max_old_space_size=8192
+        shell: bash
+        run: npx electron-builder --win --x64 --publish=never
+
+      - name: Package (Linux)
+        if: matrix.platform == 'linux'
+        env:
+          NODE_OPTIONS: --max_old_space_size=8192
+        run: npx electron-builder --linux --x64 --publish=never
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.platform }}-${{ matrix.arch }}
+          path: |
+            release/*.dmg
+            release/*.zip
+            release/*.exe
+            release/*.deb
+            release/*.AppImage
+            release/*.yml
+            release/*.blockmap
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Get build parameters
+        id: params
+        run: |
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            echo "ref=${{ github.event.client_payload.ref }}" >> $GITHUB_OUTPUT
+            echo "version=${{ github.event.client_payload.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "ref=${{ github.event.inputs.ref }}" >> $GITHUB_OUTPUT
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          fi
+
+      # We need git history from cumora to generate the changelog (diff
+      # between previous tag and this one).
+      - name: Checkout cumora source
+        uses: actions/checkout@v4
+        with:
+          repository: yetone/cumora
+          token: ${{ secrets.CUMORA_REPO_TOKEN }}
+          ref: ${{ steps.params.outputs.ref }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-artifacts
+
+      # electron-builder emits one `latest-mac.yml` per arch when each is
+      # built separately. The auto-updater reads ONE feed, so we merge
+      # the file lists from arm64 + x64 into a single yml that lists all
+      # downloadable artifacts under `files:`.
+      - name: Merge artifacts and macOS yml files
+        run: |
+          mkdir -p release
+
+          # macOS DMG / ZIP / blockmap from both arches
+          cp dist-artifacts/build-mac-arm64/*.dmg release/ 2>/dev/null || true
+          cp dist-artifacts/build-mac-arm64/*.zip release/ 2>/dev/null || true
+          cp dist-artifacts/build-mac-arm64/*.blockmap release/ 2>/dev/null || true
+          cp dist-artifacts/build-mac-x64/*.dmg release/ 2>/dev/null || true
+          cp dist-artifacts/build-mac-x64/*.zip release/ 2>/dev/null || true
+          cp dist-artifacts/build-mac-x64/*.blockmap release/ 2>/dev/null || true
+
+          ARM64_YML="dist-artifacts/build-mac-arm64/latest-mac.yml"
+          X64_YML="dist-artifacts/build-mac-x64/latest-mac.yml"
+          MERGED_YML="release/latest-mac.yml"
+
+          if [ -f "$ARM64_YML" ] && [ -f "$X64_YML" ]; then
+            echo "Merging latest-mac.yml files..."
+
+            VERSION=$(grep "^version:" "$ARM64_YML" | head -1)
+            RELEASE_DATE=$(grep "^releaseDate:" "$ARM64_YML" | head -1)
+
+            ARM64_FILES=$(awk '/^files:/{flag=1; next} /^[a-zA-Z]/ && flag{flag=0} flag' "$ARM64_YML")
+            X64_FILES=$(awk '/^files:/{flag=1; next} /^[a-zA-Z]/ && flag{flag=0} flag' "$X64_YML")
+
+            PATH_LINE=$(grep "^path:" "$ARM64_YML" | head -1)
+            SHA512_LINE=$(grep "^sha512:" "$ARM64_YML" | head -1)
+
+            echo "$VERSION" > "$MERGED_YML"
+            echo "files:" >> "$MERGED_YML"
+            echo "$ARM64_FILES" >> "$MERGED_YML"
+            echo "$X64_FILES" >> "$MERGED_YML"
+            echo "$PATH_LINE" >> "$MERGED_YML"
+            echo "$SHA512_LINE" >> "$MERGED_YML"
+            echo "$RELEASE_DATE" >> "$MERGED_YML"
+
+            echo "Merged latest-mac.yml:"
+            cat "$MERGED_YML"
+          elif [ -f "$ARM64_YML" ]; then
+            cp "$ARM64_YML" "$MERGED_YML"
+          elif [ -f "$X64_YML" ]; then
+            cp "$X64_YML" "$MERGED_YML"
+          fi
+
+          # Windows + Linux artifacts (including their own latest*.yml)
+          cp dist-artifacts/build-win-x64/* release/ 2>/dev/null || true
+          cp dist-artifacts/build-linux-x64/* release/ 2>/dev/null || true
+
+          rm -rf dist-artifacts
+          echo "=== All artifacts ==="
+          ls -la release/
+
+      # ---------- Changelog ----------
+      - name: Get previous tag
+        id: prev_tag
+        run: |
+          CURRENT_TAG="v${{ steps.params.outputs.version }}"
+          PREV_TAG=$(git tag --sort=-v:refname | grep -A1 "^${CURRENT_TAG}$" | tail -1)
+          if [ "$PREV_TAG" = "$CURRENT_TAG" ] || [ -z "$PREV_TAG" ]; then
+            PREV_TAG=$(git tag --sort=-v:refname | head -2 | tail -1)
+          fi
+          if [ -z "$PREV_TAG" ] || [ "$PREV_TAG" = "$CURRENT_TAG" ]; then
+            PREV_TAG=$(git rev-list --max-parents=0 HEAD)
+          fi
+          echo "prev_tag=$PREV_TAG" >> $GITHUB_OUTPUT
+          echo "Previous tag: $PREV_TAG"
+
+      - name: Generate changelog with LLM
+        id: changelog
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          CURRENT_TAG="v${{ steps.params.outputs.version }}"
+          COMMITS=$(git log ${{ steps.prev_tag.outputs.prev_tag }}..$CURRENT_TAG --pretty=format:"%s" --no-merges 2>/dev/null || git log --pretty=format:"%s" --no-merges -20)
+
+          echo "Found commits:"
+          echo "$COMMITS"
+
+          if [ -z "$COMMITS" ]; then
+            echo "### Changes" > /tmp/changelog.md
+            echo "" >> /tmp/changelog.md
+            echo "- Various improvements and bug fixes" >> /tmp/changelog.md
+            exit 0
+          fi
+
+          PROMPT=$(cat <<PROMPT_EOF
+          Based on the following git commit messages, generate a concise and user-friendly changelog in markdown format. Group changes by category (e.g., Features, Bug Fixes, Improvements). Only include meaningful changes, skip trivial commits. Use clear, non-technical language where possible. Output ONLY the changelog content without any preamble.
+
+          Commit messages:
+          $COMMITS
+          PROMPT_EOF
+          )
+
+          RESPONSE=$(curl -s https://api.openai.com/v1/responses \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $OPENAI_API_KEY" \
+            -d "$(jq -n --arg prompt "$PROMPT" '{
+              "model": "gpt-5.4",
+              "input": [{"role": "user", "content": $prompt}]
+            }')")
+
+          CHANGELOG=$(echo "$RESPONSE" | jq -r '.output[0].content[0].text // empty')
+
+          if [ -z "$CHANGELOG" ]; then
+            CHANGELOG=$(cat <<FALLBACK_EOF
+          ### Changes
+          $COMMITS
+          FALLBACK_EOF
+            )
+          fi
+
+          echo "$CHANGELOG" > /tmp/changelog.md
+          echo "Generated changelog:"
+          cat /tmp/changelog.md
+
+      - name: Update latest.yml files with changelog
+        run: |
+          for yml_file in release/*.yml; do
+            if [ -f "$yml_file" ]; then
+              echo "" >> "$yml_file"
+              echo "releaseNotes: |" >> "$yml_file"
+              while IFS= read -r line; do
+                echo "  $line" >> "$yml_file"
+              done < /tmp/changelog.md
+              echo "Updated $yml_file with release notes"
+            fi
+          done
+
+      # ---------- Cloudflare R2 mirror ----------
+      # The in-app updater primarily reads from GitHub Releases via the
+      # `github` publish provider configured in package.json. R2 is a
+      # mirror — useful behind firewalls that block GH downloads + edge
+      # caching. Wholly optional: when R2_* secrets aren't set, both
+      # steps below become no-ops.
+      - name: Probe R2 secrets
+        id: r2
+        env:
+          R2_KEY: ${{ secrets.R2_ACCESS_KEY_ID }}
+        run: |
+          if [ -n "$R2_KEY" ]; then
+            echo "enabled=true" >> $GITHUB_OUTPUT
+          else
+            echo "enabled=false" >> $GITHUB_OUTPUT
+            echo "R2 secrets not set — skipping mirror upload."
+          fi
+
+      - name: Configure AWS CLI for R2
+        if: steps.r2.outputs.enabled == 'true'
+        run: |
+          aws configure set aws_access_key_id ${{ secrets.R2_ACCESS_KEY_ID }}
+          aws configure set aws_secret_access_key ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          aws configure set default.region auto
+
+      - name: Upload to Cloudflare R2
+        if: steps.r2.outputs.enabled == 'true'
+        env:
+          R2_ENDPOINT: https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com
+        run: |
+          ls release/ | xargs -P 4 -I {} sh -c '
+            echo "Uploading {}..."
+            aws s3 cp "release/{}" "s3://cumora-updates/{}" \
+              --endpoint-url "'"$R2_ENDPOINT"'"
+          '
+          echo "All files uploaded to R2!"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.params.outputs.version }}
+          name: Cumora v${{ steps.params.outputs.version }}
+          draft: false
+          generate_release_notes: false
+          body_path: /tmp/changelog.md
+          files: |
+            release/*.dmg
+            release/*.zip
+            release/*.exe
+            release/*.deb
+            release/*.AppImage
+            release/*.yml
+            release/*.blockmap
+
+      - name: Probe Discord webhook
+        id: discord
+        if: success()
+        env:
+          HOOK: ${{ secrets.DISCORD_RELEASE_WEBHOOK_URL }}
+        run: |
+          if [ -n "$HOOK" ]; then
+            echo "enabled=true" >> $GITHUB_OUTPUT
+          else
+            echo "enabled=false" >> $GITHUB_OUTPUT
+            echo "Discord webhook not set — skipping announcement."
+          fi
+
+      - name: Post to Discord
+        if: steps.discord.outputs.enabled == 'true'
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_RELEASE_WEBHOOK_URL }}
+        run: |
+          VERSION="v${{ steps.params.outputs.version }}"
+          CHANGELOG=$(cat /tmp/changelog.md)
+          RELEASE_URL="https://github.com/${{ github.repository }}/releases/tag/${VERSION}"
+
+          MESSAGE="## Cumora ${VERSION}
+
+          ${CHANGELOG}
+
+          **Download:** ${RELEASE_URL}"
+
+          if [ ${#MESSAGE} -gt 1990 ]; then
+            MESSAGE="${MESSAGE:0:1987}..."
+          fi
+
+          jq -n --arg content "$MESSAGE" '{content: $content}' | \
+            curl -sf -H "Content-Type: application/json" -d @- "$DISCORD_WEBHOOK_URL"
