@@ -123,6 +123,8 @@ jobs:
       - name: Build renderer
         env:
           VITE_CUMORA_API_BASE: https://api.cumora.ai
+          VITE_PUBLIC_POSTHOG_KEY: ${{ secrets.VITE_PUBLIC_POSTHOG_KEY }}
+          VITE_PUBLIC_POSTHOG_HOST: ${{ secrets.VITE_PUBLIC_POSTHOG_HOST }}
         # Default web build emits absolute `/assets/...` paths. That
         # used to break the packaged app under file:// (white screen)
         # but the Electron main process now registers an `app://`
